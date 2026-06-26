@@ -47,39 +47,56 @@ def get_supervisor(t: dict) -> str:
     return f"Faculty: {t['author'].split(',')[0].strip()}"
 
 
-def build_adviser_ranking(results: list[dict]) -> list[dict]:
-    adviser_counts: Counter = Counter()
-    adviser_theses: defaultdict = defaultdict(list)
+def _attribute_records_to_people(records: list[dict]) -> dict[str, dict]:
+    """
+    Aggregate records per person — thesis advisers/mentors AND faculty
+    paper authors — in one place.
 
-    for t in results:
-        record_type = t.get("type", "")
+    This is shared by build_adviser_ranking() (Brain tab) and reports()
+    (Reports tab) so the two can't disagree on who gets credited. reports()
+    previously read a literal "adviser" field that doesn't exist anywhere
+    in the current schema (theses use "mentor"; faculty papers have no
+    adviser at all, just an author list), so every row in the Reports
+    tab's adviser table was silently showing "Unknown".
+    """
+    people: dict[str, dict] = defaultdict(lambda: {
+        "score": 0,
+        "domains": set(),
+        "titles": [],
+    })
 
-        if record_type == "thesis":
-            # Thesis: the mentor supervised this work
-            adviser = t.get("mentor") or "Unknown Adviser"
-            adviser_counts[adviser] += 1
-            adviser_theses[adviser].append(t["title"])
+    for t in records:
+        domain = t.get("domain")
 
-        elif record_type == "faculty_paper":
+        if t.get("type") == "thesis":
+            person = t.get("mentor") or "Unknown Adviser"
+            people[person]["score"] += 1
+            if domain:
+                people[person]["domains"].add(domain)
+            people[person]["titles"].append(t["title"])
+
+        elif t.get("type") == "faculty_paper":
             raw_authors = t.get("author", "")
             authors = [a.strip() for a in raw_authors.split(",") if a.strip()]
-
             for i, author in enumerate(authors):
-                if i == 0:
-                    # Lead/main author — 2 points
-                    adviser_counts[author] += 2
-                else:
-                    # Co-author — 1 point
-                    adviser_counts[author] += 1
-                adviser_theses[author].append(t["title"])
+                # Lead/main author counts more than a co-author
+                people[author]["score"] += 2 if i == 0 else 1
+                if domain:
+                    people[author]["domains"].add(domain)
+                people[author]["titles"].append(t["title"])
 
+    return people
+
+
+def build_adviser_ranking(results: list[dict]) -> list[dict]:
+    people = _attribute_records_to_people(results)
     return [
         {
-            "adviser": adviser,
-            "alignment_score": count,
-            "relevant_theses": list(set(adviser_theses[adviser])),  # dedupe just in case
+            "adviser": name,
+            "alignment_score": info["score"],
+            "relevant_theses": list(set(info["titles"])),
         }
-        for adviser, count in adviser_counts.most_common()
+        for name, info in sorted(people.items(), key=lambda kv: kv[1]["score"], reverse=True)
     ]
 
 # ── models ───────────────────────────────────────────────
@@ -102,13 +119,37 @@ def root():
 # BRAIN — semantic search + GPT conversational research assistant
 @app.post("/api/brain")
 def brain(req: BrainRequest):
-    results = semantic_search(req.query, req.top_k)
+    # Previously, every follow-up re-ran semantic search using ONLY the
+    # latest message. That's fine for a first question like "what do we
+    # know about xgboost" — but a natural follow-up like "what dataset did
+    # they use for that" carries almost no semantic signal on its own, so
+    # the retrieved `sources` for that turn were often unrelated to what
+    # was actually being discussed, while the system prompt simultaneously
+    # told GPT to ground its answer "solely" in those (possibly unrelated)
+    # sources.
+    #
+    # Fix: once history exists, search using the ORIGINAL opening question
+    # + the latest message combined, so retrieval stays anchored to the
+    # topic while still picking up genuine shifts in the follow-up.
+    if req.history:
+        opening_query = next(
+            (m.content for m in req.history if m.role == "user"),
+            req.query,
+        )
+        search_text = f"{opening_query}. {req.query}"
+    else:
+        search_text = req.query
+
+    results = semantic_search(search_text, req.top_k)
 
     adviser_ranking = build_adviser_ranking(results)
 
     context = "\n".join(
-        f"- [{t.get('year', 'n/d')}] \"{t['title']}\" by {t['author']} "
-        f"| {get_supervisor(t)} | Methods: {', '.join(t.get('methodology', []))}"
+        f"- [{t.get('year', 'n/d')}] \"{t['title']}\" by {t['author']}\n"
+        f"  {get_supervisor(t)}\n"
+        f"  Methods: {', '.join(t.get('methodology', [])) or 'n/a'}\n"
+        f"  Datasets: {', '.join(t.get('datasets', [])) or 'n/a'}\n"
+        f"  Abstract: {t.get('abstract', '')}"
         for t in results
     )
 
@@ -240,8 +281,10 @@ def knowledge_map(query: str = Query(default="")):
 #    GPT descriptions are generated once at startup and cached in memory
 #    so repeated page loads cost nothing.
 #
-# 2. adviser_recommendations — every adviser ranked by number of theses
-#    mentored, with the set of domains they cover.
+# 2. adviser_recommendations — every adviser/author ranked by attribution
+#    score (thesis mentorship + faculty authorship), with the domains they
+#    cover. Shares _attribute_records_to_people() with the Brain tab's
+#    build_adviser_ranking(), so the two can't drift out of sync.
 #
 # Optional query param:
 #   ?domain=  — filters both sections to theses in that domain only.
@@ -304,23 +347,18 @@ def reports(domain: str = Query(default="")):
         for tool, count in tool_counter.most_common()
     ]
 
-    # ── 2. Adviser Recommendations ────────────────────────
-    adviser_data: dict[str, dict] = defaultdict(lambda: {"count": 0, "domains": set(), "faculty": "CCSMA"})
-    for t in theses:
-        adviser = t.get("adviser", "Unknown")
-        adviser_data[adviser]["count"] += 1
-        if t.get("domain"):
-            adviser_data[adviser]["domains"].add(t["domain"])
+    # ── 2. Adviser/Author Recommendations ─────────────────
+    people = _attribute_records_to_people(theses)
 
     adviser_recommendations = sorted(
         [
             {
-                "name":             adviser,
-                "faculty":          info["faculty"],
-                "theses_mentored":  info["count"],
+                "name":             name,
+                "faculty":          "CCSMA",
+                "theses_mentored":  info["score"],
                 "domains":          sorted(info["domains"]),
             }
-            for adviser, info in adviser_data.items()
+            for name, info in people.items()
         ],
         key=lambda x: x["theses_mentored"],
         reverse=True,
